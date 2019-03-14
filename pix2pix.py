@@ -44,7 +44,7 @@ parser.add_argument("--lr", type=float, default=0.0002, help="initial learning r
 parser.add_argument("--beta1", type=float, default=0.5, help="momentum term of adam")
 parser.add_argument("--l1_weight", type=float, default=100.0, help="weight on L1 term for generator gradient")
 parser.add_argument("--gan_weight", type=float, default=1.0, help="weight on GAN term for generator gradient")
-parser.add_argument("--previous_norm", type=bool, default=False, help="batch_normalization with training always True")
+parser.add_argument("--norm_type", default="default", choices=["none", "default", "original"])
 
 # export options
 parser.add_argument("--output_filetype", default="png", choices=["png", "jpeg"])
@@ -131,9 +131,11 @@ def lrelu(x, a):
 
 
 def batchnorm(inputs):
-    if a.batch_size == 1 and not a.previous_norm:
-         return tf.contrib.layers.instance_norm(inputs, epsilon=1e-5, param_initializers={'gamma': tf.random_normal_initializer(1.0, 0.02)})
-    return tf.layers.batch_normalization(inputs, axis=3, epsilon=1e-5, momentum=0.1, training=(a.mode == "train" or a.previous_norm),
+    if a.norm_type == "none":
+        return inputs
+    if a.batch_size == 1 and a.norm_type != "original":
+        return tf.contrib.layers.instance_norm(inputs, epsilon=1e-5, param_initializers={'gamma': tf.random_normal_initializer(1.0, 0.02)})
+    return tf.layers.batch_normalization(inputs, axis=3, epsilon=1e-5, momentum=0.1, training=(a.mode == "train" or a.norm_type == "original"),
                                          gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
 
 
@@ -645,7 +647,11 @@ def main():
 
         if a.export_format == "tflite":
              from tensorflow.lite.python import lite
+             from tensorflow.core.framework import graph_pb2
+             from tensorflow.python.platform import gfile
+             from tensorflow.python.framework import dtypes
              from tensorflow.python.tools.freeze_graph import freeze_graph
+             from tensorflow.python.tools.optimize_for_inference_lib import optimize_for_inference
 
              print("freezing exported model")
              freeze_graph(input_graph="", input_saver="", input_binary=True,
@@ -654,10 +660,21 @@ def main():
                           output_graph=os.path.join(a.output_dir, "frozen_graph.pb"), clear_devices=True,
                           initializer_nodes="", input_meta_graph=os.path.join(a.output_dir, "export.meta"))
 
-             print("converting frozen model to tflite")
+             print("optimizing frozen graph")
+             input_graph_def = graph_pb2.GraphDef()
+             with gfile.Open(os.path.join(a.output_dir, "frozen_graph.pb"), "rb") as f:
+                 data = f.read()
+                 input_graph_def.ParseFromString(data)
+
+             output_graph_def = optimize_for_inference(input_graph_def, ["TFLiteInput"], ["TFLiteOutput"],
+                                                       dtypes.float32.as_datatype_enum, True)
+             with gfile.FastGFile(os.path.join(a.output_dir, "optimized_graph.pb"), "w") as f:
+                 f.write(output_graph_def.SerializeToString())
+
+             print("converting optimized graph to tflite")
              converter = lite.TFLiteConverter.from_frozen_graph(input_arrays=["TFLiteInput"],
                                                                 output_arrays=["TFLiteOutput"],
-                                                                graph_def_file=os.path.join(a.output_dir, "frozen_graph.pb"))
+                                                                graph_def_file=os.path.join(a.output_dir, "optimized_graph.pb"))
              converter.post_training_quantize = True
              output_data = converter.convert()
              with open(os.path.join(a.output_dir, "converted_model.tflite"), "wb") as f:
